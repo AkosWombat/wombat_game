@@ -6,9 +6,10 @@
 #include "wasp_string.h"
 #include "wasp_win32.h"
 
-#define PixelScale 4
+#define PixelScale 8
 #define WindowWidth 1280
 #define WindowHeight 720
+#define TilePixelSize PixelScale * 16
 
 struct texture
 {
@@ -21,6 +22,18 @@ struct animation
 {
     u32 FramesCount;
     texture *Frames;
+    u32 Width;
+    u32 Height;
+};
+
+struct tile_map
+{
+    u32 SizeX;
+    u32 SizeY;
+    u8 *Layout;
+
+    animation *Animations;
+    u32 AnimationsCount;
 };
 
 struct context
@@ -35,19 +48,39 @@ internal void AssertCallback(char *Expression, char *File, int LineNumber, char 
 {
 }
 
+internal tile_map
+TileMapCreate(memory_arena *Arena, u32 SizeX, u32 SizeY, animation *Animations, u32 AnimationsCount)
+{
+    tile_map Result = {};
+
+    Result.SizeX = SizeX;
+    Result.SizeY = SizeY;
+    Result.Layout = MemoryArenaPushArray(Arena, u8, 0, SizeX * SizeY);
+    Result.Animations = MemoryArenaPushArray(Arena, animation, 0, AnimationsCount);
+    Result.AnimationsCount = AnimationsCount;
+
+    return(Result);
+}
+
 internal texture
 TextureCreate(char *Path)
 {
     texture Result = {};
 
-    // TODO: Replace with loading form file.
-    SDL_Surface *LoadedSurface = SDL_CreateSurface(32 * PixelScale, 32 * PixelScale, GlobalContext.WindowSurface->format);
+    SDL_Surface *LoadedSurface = SDL_LoadBMP(Path);
 
-    Result.Surface = SDL_ConvertSurface(LoadedSurface, GlobalContext.WindowSurface->format);
+    if(!LoadedSurface)
+    {
+        Outf("Failed to load texture: %s", SDL_GetError());
+        Assert(0);
+    }
+
+    // Result.Surface = SDL_ConvertSurface(LoadedSurface, GlobalContext.WindowSurface->format);
+    Result.Surface = LoadedSurface;
     Result.Width = Result.Surface->w;
     Result.Height = Result.Surface->h;
 
-    SDL_DestroySurface(LoadedSurface);
+    // SDL_DestroySurface(LoadedSurface);
 
     return(Result);
 }
@@ -65,15 +98,52 @@ AnimationCreate(memory_arena *Arena, char *BaseName, u32 FramesCount)
         FrameIndex++)
     {
         u8 Buffer[1028];
-        StringFormat(Buffer, SizeOf(Buffer), "%s%d.bmp", BaseName, FrameIndex);
+        u64 Length = StringFormat(Buffer, SizeOf(Buffer), "%s%d.bmp", BaseName, FrameIndex);
+
+        Buffer[Length] = 0;
 
         Result.Frames[FrameIndex] = TextureCreate((char *)Buffer);
-    }
 
+        if(FrameIndex == 0)
+        {
+            Result.Width = Result.Frames[0].Width;
+            Result.Height = Result.Frames[0].Height;
+        }
+    }
 
     return(Result);
 }
 
+internal void
+TextureDraw(texture *Texture, u32 X, u32 Y)
+{
+    SDL_Rect SourceRect = {};
+    SourceRect.x = 0;
+    SourceRect.y = 0;
+    SourceRect.w = Texture->Width;
+    SourceRect.h = Texture->Height;
+
+    SDL_Rect DestRect = {};
+    DestRect.x = X;
+    DestRect.y = Y;
+    DestRect.w = 16 * PixelScale;
+    DestRect.h = 16 * PixelScale;
+
+    SDL_BlitSurfaceScaled(
+        Texture->Surface,
+        &SourceRect,
+        GlobalContext.WindowSurface,
+        &DestRect,
+        SDL_SCALEMODE_NEAREST);
+}
+
+internal void
+AnimationDraw(animation *Animation, u32 X, u32 Y, u32 Frame)
+{
+    u32 WrappedFrame = Frame % Animation->FramesCount;
+    texture *Texture = &Animation->Frames[WrappedFrame];
+    TextureDraw(Texture, X, Y);
+}
 
 s32 main(s32 ArgsCount, char **Args)
 {
@@ -87,13 +157,10 @@ s32 main(s32 ArgsCount, char **Args)
     GlobalContext.Window = Window;
     GlobalContext.WindowSurface = WindowSurface;
 
-    
+    animation Animation = AnimationCreate(&Arena, "assets/cuki_", 4);
 
-    // texture Test = TextureCreate(WindowSurface, "assets/");
-
-    // SDL_Surface *Test = SDL_CreateSurface(16 * PixelScale, 16 * PixelScale, WindowSurface->format);
-    // MemorySet(Test->pixels, 0xFF, Test->h * Test->pitch);
-
+    u32 FrameCounter = 0;
+    u32 SlowAnimFrame = 0;
     
     b32 Running = 1;
     while(Running)
@@ -107,21 +174,17 @@ s32 main(s32 ArgsCount, char **Args)
             }
         }
 
-        SDL_Rect SourceRect = {};
-        SourceRect.x = 0;
-        SourceRect.y = 0;
-        SourceRect.w = 16 * PixelScale;
-        SourceRect.h = 16 * PixelScale;
+        SDL_ClearSurface(WindowSurface, 0, 0, 0, 1);
 
-        SDL_Rect DestRect = {};
-        DestRect.x = 0;
-        DestRect.y = 0;
-        DestRect.w = 16 * PixelScale;
-        DestRect.h = 16 * PixelScale;
-
-        SDL_BlitSurface(Test, &SourceRect, WindowSurface, &DestRect);
+        AnimationDraw(&Animation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize / 2, SlowAnimFrame);
 
         SDL_UpdateWindowSurface(Window);
+
+        FrameCounter++;
+        if(FrameCounter % 100 == 0)
+        {
+            SlowAnimFrame++;
+        }
     }
 
     SDL_Quit();
