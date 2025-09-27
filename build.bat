@@ -9,7 +9,8 @@ cl /nologo /Zi /FC /WX /W4 /wd4505 /wd4201 /wd4090 /wd4324 /wd4189 /wd4100 /wd41
 
 popd
 
-copy ..\build\wombat_main.exe ..\output\
+copy .\build\wombat_main.exe .\output\
+
 pushd output
 wombat_main.exe
 popd
