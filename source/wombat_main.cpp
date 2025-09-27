@@ -36,9 +36,22 @@ struct collision_map
 struct enemy
 {
     u32 Type;
-    f32 PositionX;
-    f32 PositionY;
+    v2 Position;
     f32 Angle;
+    f32 TimeOfNextShot;
+    b32 Dead;
+};
+
+struct projectile
+{
+    projectile *Prev;
+    projectile *Next;
+
+    u32 Type;
+    v2 Position;
+    v2 LastPosition;
+    v2 Velocity;
+    b32 IsEnemy;
 };
 
 struct tile_map
@@ -49,6 +62,13 @@ struct tile_map
 
     animation *Animations;
     u32 AnimationsCount;
+};
+
+struct font
+{
+    texture Atlas;
+    u32 GlyphWidth;
+    u32 GlyphHeight;
 };
 
 struct context
@@ -64,14 +84,31 @@ struct context
 
     f32 MovementSpeed;
     f32 EnemySpeed;
+    u32 ProjectileDamage;
+    f32 ProjectileSpeed;
+    f32 FireRate;
+    f32 FireRateRandomFactor;
+    f32 WaveCooldown;
 
     u32 Seed;
 
     enemy *Enemies;
     u32 EnemiesCapacity;
     u32 EnemiesCount;
+    u32 EnemiesRemaining;
+
+    projectile Projectiles;
+    projectile FreeProjectiles;
+
+    u32 Health;
+    u32 MaxHealth;
 
     f32 TimeOfLastRegenerate;
+    f32 TimeOfLastWaveEnd;
+    b32 IsWaitingForNextWave;
+    u32 WaveIndex;
+
+    v2 ViewDirection;
 };
 
 global context GlobalContext;
@@ -226,6 +263,73 @@ AnimationCreate(memory_arena *Arena, char *BaseName, u32 FramesCount)
     }
 
     return(Result);
+}
+
+internal font
+FontCreate(char *Path, u32 GlyphWidth, u32 GlyphHeight)
+{
+    font Result = {};
+
+    Result.Atlas = TextureCreate(Path);
+    Result.GlyphWidth = GlyphWidth;
+    Result.GlyphHeight = GlyphHeight;
+
+    return(Result);
+}
+
+internal void
+FontDraw(font *Font, string String, u32 X, u32 Y, b32 Centered)
+{
+    if(Centered)
+    {
+        X -= (u32)String.Size * Font->GlyphWidth * PixelScale / 2;
+    }
+
+    for(u32 CharacterIndex = 0;
+        CharacterIndex < String.Size;
+        CharacterIndex++)
+    {
+        u32 Codepoint = String.Data[CharacterIndex];
+        u32 Index = 0;
+        b32 FoundIndex = 0;
+        if(Codepoint >= 'A' && Codepoint <= 'Z')
+        {
+            Index = Codepoint - 'A';
+            FoundIndex = 1;
+        }
+        if(Codepoint >= '0' && Codepoint <= '9')
+        {
+            Index = Codepoint - '0' + 'Z' - 'A' + 1;
+            FoundIndex = 1;
+        }
+
+        if(FoundIndex)
+        {
+            u32 Row = Index / 9;
+            u32 Column = Index % 9;
+    
+            SDL_Rect SourceRect = {};
+            SourceRect.x = Font->GlyphWidth * Column;
+            SourceRect.y = Font->GlyphHeight * Row;
+            SourceRect.w = Font->GlyphWidth;
+            SourceRect.h = Font->GlyphHeight;
+    
+            SDL_Rect DestRect = {};
+            DestRect.x = X;
+            DestRect.y = Y;
+            DestRect.w = Font->GlyphWidth * PixelScale;
+            DestRect.h = Font->GlyphHeight * PixelScale;
+    
+            SDL_BlitSurfaceScaled(
+                Font->Atlas.Surface,
+                &SourceRect,
+                GlobalContext.WindowSurface,
+                &DestRect,
+                SDL_SCALEMODE_NEAREST);
+        }
+
+        X += (Font->GlyphWidth + 1) * PixelScale;
+    }
 }
 
 internal void
@@ -431,6 +535,7 @@ internal void
 SpawnEnemies(u32 Count, f32 X, f32 Y, f32 Radius)
 {
     GlobalContext.EnemiesCount = Count;
+    GlobalContext.EnemiesRemaining = Count;
 
     for(u32 Index = 0;
         Index < Count;
@@ -440,15 +545,48 @@ SpawnEnemies(u32 Count, f32 X, f32 Y, f32 Radius)
 
         f32 RandomAngle = (f32)GetRandom() / (f32)MaxU32 * 2 * Pi;
 
-        GlobalContext.Enemies[Index].PositionX = Cos(RandomAngle) * Radius + X;
-        GlobalContext.Enemies[Index].PositionY = Abs(Sin(RandomAngle)) * Radius + Y;
+        GlobalContext.Enemies[Index].Position = V2(Cos(RandomAngle) * Radius + X, Abs(Sin(RandomAngle)) * Radius + Y);
     }
 }
 
-b32 LineIntersection(f32 X1, f32 Y1, f32 X2, f32 Y2,
+internal void
+InitProjectiles(memory_arena *Arena, u32 Capacity)
+{
+    DoublyLinkedListInit(&GlobalContext.Projectiles);
+    DoublyLinkedListInit(&GlobalContext.FreeProjectiles);
+
+    projectile *Projectiles = MemoryArenaPushArray(Arena, projectile, 0, Capacity);
+    for(u32 Index = 0;
+        Index < Capacity;
+        Index++)
+    {
+        DoublyLinkedListInsertAfter(&GlobalContext.FreeProjectiles, &Projectiles[Index]);
+    }
+}
+
+internal void
+ProjectileSpawn(v2 Position, v2 Velocity, b32 IsEnemy, u32 Type)
+{
+    projectile *Projectile = GlobalContext.FreeProjectiles.Next;
+
+    DoublyLinkedListRemove(Projectile);
+    DoublyLinkedListInsertAfter(&GlobalContext.Projectiles, Projectile);
+
+    Projectile->IsEnemy = IsEnemy;
+    Projectile->LastPosition = Position;
+    Projectile->Position = Position;
+    Projectile->Velocity = Velocity;
+    Projectile->Type = Type;
+}
+
+internal b32
+LineIntersection(f32 X1, f32 Y1, f32 X2, f32 Y2,
                     f32 X3, f32 Y3, f32 X4, f32 Y4) {
     f32 Denom = (X1 - X2) * (Y3 - Y4) - (Y1 - Y2) * (X3 - X4);
-    if (Denom == 0.0f) return false; // Lines are parallel
+    if (Denom == 0.0f)
+    {
+        return false;
+    }
 
     f32 T = ((X1 - X3) * (Y3 - Y4) - (Y1 - Y3) * (X3 - X4)) / Denom;
     f32 U = -((X1 - X2) * (Y1 - Y3) - (Y1 - Y2) * (X1 - X3)) / Denom;
@@ -456,30 +594,128 @@ b32 LineIntersection(f32 X1, f32 Y1, f32 X2, f32 Y2,
     return (T >= 0 && T <= 1 && U >= 0 && U <= 1);
 }
 
-b32 RectLineIntersection(f32 posx, f32 posy, f32 width, f32 height,
-                                 f32 startx, f32 starty, f32 endx, f32 endy) {
-    // Rectangle corners
-    f32 left   = posx;
-    f32 right  = posx + width;
-    f32 top    = posy;
-    f32 bottom = posy + height;
+internal b32
+RectLineIntersection(f32 PosX, f32 PosY, f32 Width, f32 Height,
+                                 f32 StartX, f32 StartY, f32 EndX, f32 EndY) {
+    f32 Left   = PosX;
+    f32 Right  = PosX + Width;
+    f32 Top    = PosY;
+    f32 Bottom = PosY + Height;
 
-    // Check intersection with each edge of the rectangle
-    // Top edge
-    if (LineIntersection(startx, starty, endx, endy, left, top, right, top)) return true;
-    // Bottom edge
-    if (LineIntersection(startx, starty, endx, endy, left, bottom, right, bottom)) return true;
-    // Left edge
-    if (LineIntersection(startx, starty, endx, endy, left, top, left, bottom)) return true;
-    // Right edge
-    if (LineIntersection(startx, starty, endx, endy, right, top, right, bottom)) return true;
-
-    // Optionally, check if the line is completely inside the rectangle
-    if (startx >= left && startx <= right && starty >= top && starty <= bottom &&
-        endx >= left && endx <= right && endy >= top && endy <= bottom)
+    if (LineIntersection(StartX, StartY, EndX, EndY, Left, Top, Right, Top))
+    {
         return true;
+    }
+
+    if (LineIntersection(StartX, StartY, EndX, EndY, Left, Bottom, Right, Bottom))
+    {
+        return true;
+    }
+
+    if (LineIntersection(StartX, StartY, EndX, EndY, Left, Top, Left, Bottom))
+    {
+        return true;
+    }
+
+    if (LineIntersection(StartX, StartY, EndX, EndY, Right, Top, Right, Bottom))
+    {
+        return true;
+    }
+
+    if (StartX >= Left && StartX <= Right && StartY >= Top && StartY <= Bottom &&
+        EndX >= Left && EndX <= Right && EndY >= Top && EndY <= Bottom)
+    {
+        return true;
+    }
 
     return false;
+}
+
+internal void
+ProjectileUpdate(f32 DeltaTime)
+{
+    projectile *ProjectileNext = 0;
+    for(projectile *Projectile = GlobalContext.Projectiles.Next;
+        Projectile != &GlobalContext.Projectiles;
+        Projectile = ProjectileNext)
+    {
+        ProjectileNext = Projectile->Next;
+
+        Projectile->LastPosition = Projectile->Position;
+        Projectile->Position = Projectile->Position + Projectile->Velocity * DeltaTime;
+
+        b32 ShouldDelete = 0;
+
+        if(Projectile->IsEnemy)
+        {
+            if(RectLineIntersection(
+                GlobalContext.PlayerX - 0.5f,
+                GlobalContext.PlayerY - 0.5f,
+                1.0f,
+                1.0f,
+                Projectile->LastPosition.X,
+                Projectile->LastPosition.Y,
+                Projectile->Position.X,
+                Projectile->Position.Y))
+            {
+                ShouldDelete = 1;
+
+                if(GlobalContext.Health > GlobalContext.ProjectileDamage)
+                {
+                    GlobalContext.Health -= GlobalContext.ProjectileDamage;
+                }
+                else
+                {
+                    GlobalContext.Health = 0;
+                }
+            }
+        }
+        else
+        {
+            for(u32 EnemyIndex = 0; 
+                EnemyIndex < GlobalContext.EnemiesCount;
+                EnemyIndex++)
+            {
+                enemy *Enemy = &GlobalContext.Enemies[EnemyIndex];
+    
+                if(RectLineIntersection(
+                    Enemy->Position.X - 0.5f,
+                    Enemy->Position.X - 0.5f,
+                    1.0f,
+                    1.0f,
+                    Projectile->LastPosition.X,
+                    Projectile->LastPosition.Y,
+                    Projectile->Position.X,
+                    Projectile->Position.Y))
+                {
+                    ShouldDelete = 1;
+                    
+                    Enemy->Dead = 1;
+                    GlobalContext.EnemiesRemaining--;
+                }
+            }
+        }
+
+        if(Projectile->Position.X < 0 || Projectile->Position.Y < 0 || Projectile->Position.X > 32 || Projectile->Position.Y > 32)
+        {
+            ShouldDelete = 1;
+        }
+
+        if(ShouldDelete)
+        {
+            DoublyLinkedListRemove(Projectile);
+            DoublyLinkedListInsertBefore(&GlobalContext.FreeProjectiles, Projectile);
+        }
+    }
+}
+
+internal v2
+GetScreenPos(v2 World)
+{
+    v2 Result = V2(
+        -GlobalContext.PlayerX * TilePixelSize + WindowWidth / 2.0f + (f32)TilePixelSize * World.X,
+        -GlobalContext.PlayerY * TilePixelSize + WindowHeight / 2.0f + (f32)TilePixelSize * World.Y);
+    return(Result);
 }
 
 s32 main(s32 ArgsCount, char **Args)
@@ -533,9 +769,16 @@ s32 main(s32 ArgsCount, char **Args)
     animation Fire = AnimationCreate(&Arena, "assets/fire", 1);
     animation Water = AnimationCreate(&Arena, "assets/water", 1);
 
+    animation Ball = AnimationCreate(&Arena, "assets/ball", 1);
+
     animation Enemies[] =
     {
         Fire, Water
+    };
+
+    animation Projectiles[] =
+    {
+        Ball
     };
 
     animation MapAnimations[] =
@@ -625,13 +868,23 @@ s32 main(s32 ArgsCount, char **Args)
     u64 StartTime = SDL_GetPerformanceCounter();
     u64 LastTime = StartTime;
 
-    GlobalContext.MovementSpeed = 15.0f;
+    GlobalContext.MovementSpeed = 5.0f;
     GlobalContext.EnemySpeed = 2.0f;
 
     GlobalContext.EnemiesCapacity = 1024;
     GlobalContext.Enemies = MemoryArenaPushArray(&Arena, enemy, 0, GlobalContext.EnemiesCapacity);
+    
+    GlobalContext.MaxHealth = 100;
+    GlobalContext.Health = 100;
+    GlobalContext.ProjectileDamage = 3;
+    GlobalContext.ProjectileSpeed = 7.0f;
+    GlobalContext.FireRate = 1.4f;
+    GlobalContext.FireRateRandomFactor = 0.8f;
+    GlobalContext.WaveCooldown = 8.0f;
 
-    SpawnEnemies(5, CollisionMap.SizeX / 2.0f, CollisionMap.SizeY / 2.0f, 5);
+    font Font = FontCreate("assets/fontatlas2.bmp", 5, 5);
+
+    InitProjectiles(&Arena, 128);
     
     b32 Running = 1;
     while(Running)
@@ -641,6 +894,8 @@ s32 main(s32 ArgsCount, char **Args)
 
         f32 DeltaTime = (f32)(CurrentTime - LastTime) / (f32)Frequency;
         f32 Time = (f32)(CurrentTime - StartTime) / (f32)Frequency;
+
+        b32 ShouldShoot = 0;
 
         SDL_Event Event;
         while(SDL_PollEvent(&Event))
@@ -705,7 +960,19 @@ s32 main(s32 ArgsCount, char **Args)
                     }
                 }
             }
+
+            if(Event.type == SDL_EVENT_MOUSE_MOTION)
+            {
+                GlobalContext.ViewDirection = Normalize(V2(Event.motion.x, Event.motion.y) - V2(WindowWidth / 2.0f, WindowHeight / 2.0f));
+            }
+
+            if(Event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && Event.button.button == SDL_BUTTON_LEFT)
+            {
+                ShouldShoot = 1;
+            }
         }
+
+        f32 VelocityX = GlobalContext.DirectionX * DeltaTime * GlobalContext.MovementSpeed;
 
         GlobalContext.PlayerX += GlobalContext.DirectionX * DeltaTime * GlobalContext.MovementSpeed;
         if(GlobalContext.DirectionX > 0.0f)
@@ -713,6 +980,7 @@ s32 main(s32 ArgsCount, char **Args)
             if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
             {
                 GlobalContext.PlayerX = (u32)GlobalContext.PlayerX - 0.01f;
+                VelocityX = 0.0f;
             }
         }
         else if(GlobalContext.DirectionX < 0.0f)
@@ -720,8 +988,11 @@ s32 main(s32 ArgsCount, char **Args)
             if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
             {
                 GlobalContext.PlayerX = (u32)GlobalContext.PlayerX + 1.0f;
+                VelocityX = 0.0f;
             }
         }
+
+        f32 VelocityY = GlobalContext.DirectionY * DeltaTime * GlobalContext.MovementSpeed;
         
         GlobalContext.PlayerY += GlobalContext.DirectionY * DeltaTime * GlobalContext.MovementSpeed;
         if(GlobalContext.DirectionY > 0.0f)
@@ -729,6 +1000,7 @@ s32 main(s32 ArgsCount, char **Args)
             if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
             {
                 GlobalContext.PlayerY = (f32)(u32)GlobalContext.PlayerY - 0.01f;
+                VelocityY = 0.0f;
             }
         }
         else if(GlobalContext.DirectionY < 0.0f)
@@ -736,6 +1008,7 @@ s32 main(s32 ArgsCount, char **Args)
             if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
             {
                 GlobalContext.PlayerY = (u32)GlobalContext.PlayerY + 1.0f;
+                VelocityY = 0.0f;
             }
         }
 
@@ -761,29 +1034,74 @@ s32 main(s32 ArgsCount, char **Args)
         {
             enemy *Enemy = &GlobalContext.Enemies[Index];
 
-            animation *Animation = &Enemies[Enemy->Type];
-
-            u32 TransformedX = (u32)(-GlobalContext.PlayerX * TilePixelSize + WindowWidth / 2.0f + (f32)TilePixelSize * Enemy->PositionX);
-            u32 TransformedY = (u32)(-GlobalContext.PlayerY * TilePixelSize + WindowHeight / 2.0f + (f32)TilePixelSize * Enemy->PositionY);
-
-            AnimationDraw(Animation, TransformedX - TilePixelSize / 2, TransformedY - TilePixelSize / 2, SlowAnimFrame);
-
-            v2 Target = V2(GlobalContext.PlayerX + Cos(Enemy->Angle) * 3, GlobalContext.PlayerY + Sin(Enemy->Angle) * 3);
-
-            v2 Delta = Normalize(Target - V2(Enemy->PositionX, Enemy->PositionY)) * GlobalContext.EnemySpeed * DeltaTime;
-            Enemy->PositionX += Delta.X;
-            Enemy->PositionY += Delta.Y;
-
-            if(ShouldRegenerateAngle)
+            if(!Enemy->Dead)
             {
-                Enemy->Angle = (f32)GetRandom() / (f32)MaxU32 * 2 * Pi;
+                animation *Animation = &Enemies[Enemy->Type];
+    
+                v2 Transformed = GetScreenPos(Enemy->Position);
+                AnimationDraw(Animation, (u32)Transformed.X - TilePixelSize / 2, (u32)Transformed.Y - TilePixelSize / 2, SlowAnimFrame);
+    
+                v2 Target = V2(GlobalContext.PlayerX + Cos(Enemy->Angle) * 3, GlobalContext.PlayerY + Sin(Enemy->Angle) * 3);
+    
+                v2 Delta = Normalize(Target - V2(Enemy->Position.X, Enemy->Position.Y)) * GlobalContext.EnemySpeed * DeltaTime;
+                Enemy->Position.X += Delta.X;
+                Enemy->Position.Y += Delta.Y;
+    
+                if(ShouldRegenerateAngle)
+                {
+                    Enemy->Angle = (f32)GetRandom() / (f32)MaxU32 * 2 * Pi;
+                }
+    
+                if(Time > Enemy->TimeOfNextShot)
+                {
+                    Enemy->TimeOfNextShot = Time + GlobalContext.FireRate + GlobalContext.FireRateRandomFactor * (f32)GetRandom() / (f32)MaxU32;
+    
+                    v2 ShotDelta = Normalize(V2(GlobalContext.PlayerX, GlobalContext.PlayerY) - Enemy->Position) * GlobalContext.ProjectileSpeed;
+    
+                    ProjectileSpawn(Enemy->Position, ShotDelta, 1, 0);
+                }
             }
+        }
+
+        ProjectileUpdate(DeltaTime);
+
+        for(projectile *Projectile = GlobalContext.Projectiles.Next;
+            Projectile != &GlobalContext.Projectiles;
+            Projectile = Projectile->Next)
+        {
+            v2 Transformed = GetScreenPos(Projectile->Position);
+            animation *Animation = &Projectiles[Projectile->Type];
+            AnimationDraw(Animation, (u32)Transformed.X - TilePixelSize / 2, (u32)Transformed.Y - TilePixelSize / 2, SlowAnimFrame);
+        }
+
+        if(ShouldShoot && GlobalContext.Health > 10)
+        {
+            GlobalContext.Health -= 10;
+            ProjectileSpawn(V2(GlobalContext.PlayerX, GlobalContext.PlayerY) + V2(VelocityX, VelocityY), GlobalContext.ViewDirection * GlobalContext.ProjectileSpeed, 0, 0);
+        }
+
+        if(GlobalContext.EnemiesRemaining == 0 && !GlobalContext.IsWaitingForNextWave)
+        {
+            GlobalContext.TimeOfLastWaveEnd = Time;
+            GlobalContext.IsWaitingForNextWave = 1;
+        }
+
+        if(GlobalContext.IsWaitingForNextWave && GlobalContext.TimeOfLastWaveEnd + GlobalContext.WaveCooldown < Time)
+        {
+            GlobalContext.IsWaitingForNextWave = 0;
+
+            SpawnEnemies((GlobalContext.WaveIndex + 1) * 2 + GetRandom() % 2, CollisionMap.SizeX / 2.0f, CollisionMap.SizeY / 2.0f, 5);
         }
 
         AnimationDraw(&CharacterAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
 
-        TextureDrawCustomPartial(&HealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2 + 5 * PixelScale, WindowHeight - 100 + 2 * PixelScale, 0.5f);
+        TextureDrawCustomPartial(&HealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2 + 5 * PixelScale, WindowHeight - 100 + 2 * PixelScale, (f32)GlobalContext.Health / (f32)GlobalContext.MaxHealth);
         TextureDrawCustom(&BlankHealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2, WindowHeight - 100);
+
+        if(GlobalContext.PlayerX >= MapSizeY / 2 - 3 && GlobalContext.PlayerX <= MapSizeY / 2 + 3 && GlobalContext.PlayerY >= MapMargin - 4 && GlobalContext.PlayerY <= MapMargin + 2)
+        {
+            FontDraw(&Font, StringBundleZ("SPACE FOR MENU"), WindowWidth / 2, WindowHeight - 150, 1);
+        }
 
         SDL_UpdateWindowSurface(Window);
 
