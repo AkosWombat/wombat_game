@@ -362,13 +362,13 @@ TextureDrawCustomPartial(texture *Texture, u32 X, u32 Y, f32 Percentage)
     SourceRect.x = 0;
     SourceRect.y = 0;
     SourceRect.w = (u32)(Texture->Width * Percentage);
-    SourceRect.h = (u32)(Texture->Height * Percentage);
+    SourceRect.h = (u32)Texture->Height;
 
     SDL_Rect DestRect = {};
     DestRect.x = X;
     DestRect.y = Y;
     DestRect.w = (u32)(Texture->Width * Percentage) * PixelScale;
-    DestRect.h = (u32)(Texture->Height * Percentage) * PixelScale;
+    DestRect.h = (u32)(Texture->Height) * PixelScale;
 
     SDL_BlitSurfaceScaled(
         Texture->Surface,
@@ -589,7 +589,7 @@ LineIntersection(f32 X1, f32 Y1, f32 X2, f32 Y2,
     }
 
     f32 T = ((X1 - X3) * (Y3 - Y4) - (Y1 - Y3) * (X3 - X4)) / Denom;
-    f32 U = -((X1 - X2) * (Y1 - Y3) - (Y1 - Y2) * (X1 - X3)) / Denom;
+    f32 U = ((X1 - X3) * (Y1 - Y2) - (Y1 - Y3) * (X1 - X2)) / Denom;
 
     return (T >= 0 && T <= 1 && U >= 0 && U <= 1);
 }
@@ -862,8 +862,8 @@ s32 main(s32 ArgsCount, char **Args)
     u32 SlowAnimFrame = 0;
     u32 FastAnimFrame = 0;
 
-    GlobalContext.PlayerX = MapMargin + 0.5f;
-    GlobalContext.PlayerY = MapMargin + 0.5f;
+    GlobalContext.PlayerX = CollisionMap.SizeX / 2.0f;
+    GlobalContext.PlayerY = CollisionMap.SizeY / 2.0f;
 
     u64 StartTime = SDL_GetPerformanceCounter();
     u64 LastTime = StartTime;
@@ -896,6 +896,7 @@ s32 main(s32 ArgsCount, char **Args)
         f32 Time = (f32)(CurrentTime - StartTime) / (f32)Frequency;
 
         b32 ShouldShoot = 0;
+        b32 ShouldRestart = 0;
 
         SDL_Event Event;
         while(SDL_PollEvent(&Event))
@@ -956,6 +957,11 @@ s32 main(s32 ArgsCount, char **Args)
                         case 'a':
                         {
                             GlobalContext.DirectionX -= 1;
+                        } break;
+
+                        case 'r':
+                        {
+                            ShouldRestart = 1;
                         } break;
                     }
                 }
@@ -1095,7 +1101,7 @@ s32 main(s32 ArgsCount, char **Args)
 
         AnimationDraw(&CharacterAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
 
-        TextureDrawCustomPartial(&HealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2 + 5 * PixelScale, WindowHeight - 100 + 2 * PixelScale, (f32)GlobalContext.Health / (f32)GlobalContext.MaxHealth);
+        TextureDrawCustomPartial(&HealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2 + 1 * PixelScale, WindowHeight - 100 + 2 * PixelScale, (f32)GlobalContext.Health / (f32)GlobalContext.MaxHealth);
         TextureDrawCustom(&BlankHealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2, WindowHeight - 100);
 
         if(GlobalContext.PlayerX >= MapSizeY / 2 - 3 && GlobalContext.PlayerX <= MapSizeY / 2 + 3 && GlobalContext.PlayerY >= MapMargin - 4 && GlobalContext.PlayerY <= MapMargin + 2)
@@ -1104,6 +1110,18 @@ s32 main(s32 ArgsCount, char **Args)
         }
 
         SDL_UpdateWindowSurface(Window);
+
+        if(ShouldRestart)
+        {
+            GlobalContext.PlayerX = CollisionMap.SizeX / 2.0f;
+            GlobalContext.PlayerY = CollisionMap.SizeY / 2.0f;
+
+            GlobalContext.TimeOfLastRegenerate = 0;
+            GlobalContext.TimeOfLastWaveEnd = Time;
+
+            GlobalContext.EnemiesCount = 0;
+            GlobalContext.EnemiesRemaining = 0;
+        }
 
         SlowAnimFrame = (u32)(Time * 2);
         FastAnimFrame = (u32)(Time * 3);
