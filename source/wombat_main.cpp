@@ -33,6 +33,14 @@ struct collision_map
     b8 *Layout;
 };
 
+struct enemy
+{
+    u32 Type;
+    f32 PositionX;
+    f32 PositionY;
+    f32 Angle;
+};
+
 struct tile_map
 {
     u32 SizeX;
@@ -55,8 +63,15 @@ struct context
     f32 DirectionY;
 
     f32 MovementSpeed;
+    f32 EnemySpeed;
 
     u32 Seed;
+
+    enemy *Enemies;
+    u32 EnemiesCapacity;
+    u32 EnemiesCount;
+
+    f32 TimeOfLastRegenerate;
 };
 
 global context GlobalContext;
@@ -214,6 +229,52 @@ AnimationCreate(memory_arena *Arena, char *BaseName, u32 FramesCount)
 }
 
 internal void
+TextureDrawCustom(texture *Texture, u32 X, u32 Y)
+{
+    SDL_Rect SourceRect = {};
+    SourceRect.x = 0;
+    SourceRect.y = 0;
+    SourceRect.w = Texture->Width;
+    SourceRect.h = Texture->Height;
+
+    SDL_Rect DestRect = {};
+    DestRect.x = X;
+    DestRect.y = Y;
+    DestRect.w = Texture->Width * PixelScale;
+    DestRect.h = Texture->Height * PixelScale;
+
+    SDL_BlitSurfaceScaled(
+        Texture->Surface,
+        &SourceRect,
+        GlobalContext.WindowSurface,
+        &DestRect,
+        SDL_SCALEMODE_NEAREST);
+}
+
+internal void
+TextureDrawCustomPartial(texture *Texture, u32 X, u32 Y, f32 Percentage)
+{
+    SDL_Rect SourceRect = {};
+    SourceRect.x = 0;
+    SourceRect.y = 0;
+    SourceRect.w = (u32)(Texture->Width * Percentage);
+    SourceRect.h = (u32)(Texture->Height * Percentage);
+
+    SDL_Rect DestRect = {};
+    DestRect.x = X;
+    DestRect.y = Y;
+    DestRect.w = (u32)(Texture->Width * Percentage) * PixelScale;
+    DestRect.h = (u32)(Texture->Height * Percentage) * PixelScale;
+
+    SDL_BlitSurfaceScaled(
+        Texture->Surface,
+        &SourceRect,
+        GlobalContext.WindowSurface,
+        &DestRect,
+        SDL_SCALEMODE_NEAREST);
+}
+
+internal void
 TextureDraw(texture *Texture, u32 X, u32 Y)
 {
     SDL_Rect SourceRect = {};
@@ -366,6 +427,61 @@ IsWalkable(collision_map *CollisionMap, u32 X, u32 Y)
     return(Result);
 }
 
+internal void
+SpawnEnemies(u32 Count, f32 X, f32 Y, f32 Radius)
+{
+    GlobalContext.EnemiesCount = Count;
+
+    for(u32 Index = 0;
+        Index < Count;
+        Index++)
+    {
+        GlobalContext.Enemies[Index].Type = GetRandom() % 2;
+
+        f32 RandomAngle = (f32)GetRandom() / (f32)MaxU32 * 2 * Pi;
+
+        GlobalContext.Enemies[Index].PositionX = Cos(RandomAngle) * Radius + X;
+        GlobalContext.Enemies[Index].PositionY = Abs(Sin(RandomAngle)) * Radius + Y;
+    }
+}
+
+b32 LineIntersection(f32 X1, f32 Y1, f32 X2, f32 Y2,
+                    f32 X3, f32 Y3, f32 X4, f32 Y4) {
+    f32 Denom = (X1 - X2) * (Y3 - Y4) - (Y1 - Y2) * (X3 - X4);
+    if (Denom == 0.0f) return false; // Lines are parallel
+
+    f32 T = ((X1 - X3) * (Y3 - Y4) - (Y1 - Y3) * (X3 - X4)) / Denom;
+    f32 U = -((X1 - X2) * (Y1 - Y3) - (Y1 - Y2) * (X1 - X3)) / Denom;
+
+    return (T >= 0 && T <= 1 && U >= 0 && U <= 1);
+}
+
+b32 RectLineIntersection(f32 posx, f32 posy, f32 width, f32 height,
+                                 f32 startx, f32 starty, f32 endx, f32 endy) {
+    // Rectangle corners
+    f32 left   = posx;
+    f32 right  = posx + width;
+    f32 top    = posy;
+    f32 bottom = posy + height;
+
+    // Check intersection with each edge of the rectangle
+    // Top edge
+    if (LineIntersection(startx, starty, endx, endy, left, top, right, top)) return true;
+    // Bottom edge
+    if (LineIntersection(startx, starty, endx, endy, left, bottom, right, bottom)) return true;
+    // Left edge
+    if (LineIntersection(startx, starty, endx, endy, left, top, left, bottom)) return true;
+    // Right edge
+    if (LineIntersection(startx, starty, endx, endy, right, top, right, bottom)) return true;
+
+    // Optionally, check if the line is completely inside the rectangle
+    if (startx >= left && startx <= right && starty >= top && starty <= bottom &&
+        endx >= left && endx <= right && endy >= top && endy <= bottom)
+        return true;
+
+    return false;
+}
+
 s32 main(s32 ArgsCount, char **Args)
 {
     SDL_Init(SDL_INIT_VIDEO);
@@ -410,6 +526,17 @@ s32 main(s32 ArgsCount, char **Args)
     animation Temple10 = AnimationCreate(&Arena, "assets/temple_10", 1);
     animation Temple11 = AnimationCreate(&Arena, "assets/temple_11", 1);
     animation Temple12 = AnimationCreate(&Arena, "assets/temple_12", 1);
+
+    texture BlankHealthBar = TextureCreate("assets/blank_health_bar.bmp");
+    texture HealthBar = TextureCreate("assets/health_bar.bmp");
+
+    animation Fire = AnimationCreate(&Arena, "assets/fire", 1);
+    animation Water = AnimationCreate(&Arena, "assets/water", 1);
+
+    animation Enemies[] =
+    {
+        Fire, Water
+    };
 
     animation MapAnimations[] =
     {
@@ -499,6 +626,12 @@ s32 main(s32 ArgsCount, char **Args)
     u64 LastTime = StartTime;
 
     GlobalContext.MovementSpeed = 15.0f;
+    GlobalContext.EnemySpeed = 2.0f;
+
+    GlobalContext.EnemiesCapacity = 1024;
+    GlobalContext.Enemies = MemoryArenaPushArray(&Arena, enemy, 0, GlobalContext.EnemiesCapacity);
+
+    SpawnEnemies(5, CollisionMap.SizeX / 2.0f, CollisionMap.SizeY / 2.0f, 5);
     
     b32 Running = 1;
     while(Running)
@@ -615,7 +748,42 @@ s32 main(s32 ArgsCount, char **Args)
         TileMapDraw(&IslandMap, TileMapX, TileMapY, FastAnimFrame);
         TileMapDraw(&OverlayMap, TileMapX, TileMapY, FastAnimFrame);
 
+        b32 ShouldRegenerateAngle = 0;
+        if(GlobalContext.TimeOfLastRegenerate + 1.0f < Time)
+        {
+            ShouldRegenerateAngle = 1;
+            GlobalContext.TimeOfLastRegenerate = Time;
+        }
+
+        for(u32 Index = 0;
+            Index < GlobalContext.EnemiesCount;
+            Index++)
+        {
+            enemy *Enemy = &GlobalContext.Enemies[Index];
+
+            animation *Animation = &Enemies[Enemy->Type];
+
+            u32 TransformedX = (u32)(-GlobalContext.PlayerX * TilePixelSize + WindowWidth / 2.0f + (f32)TilePixelSize * Enemy->PositionX);
+            u32 TransformedY = (u32)(-GlobalContext.PlayerY * TilePixelSize + WindowHeight / 2.0f + (f32)TilePixelSize * Enemy->PositionY);
+
+            AnimationDraw(Animation, TransformedX - TilePixelSize / 2, TransformedY - TilePixelSize / 2, SlowAnimFrame);
+
+            v2 Target = V2(GlobalContext.PlayerX + Cos(Enemy->Angle) * 3, GlobalContext.PlayerY + Sin(Enemy->Angle) * 3);
+
+            v2 Delta = Normalize(Target - V2(Enemy->PositionX, Enemy->PositionY)) * GlobalContext.EnemySpeed * DeltaTime;
+            Enemy->PositionX += Delta.X;
+            Enemy->PositionY += Delta.Y;
+
+            if(ShouldRegenerateAngle)
+            {
+                Enemy->Angle = (f32)GetRandom() / (f32)MaxU32 * 2 * Pi;
+            }
+        }
+
         AnimationDraw(&CharacterAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
+
+        TextureDrawCustomPartial(&HealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2 + 5 * PixelScale, WindowHeight - 100 + 2 * PixelScale, 0.5f);
+        TextureDrawCustom(&BlankHealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2, WindowHeight - 100);
 
         SDL_UpdateWindowSurface(Window);
 
