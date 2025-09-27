@@ -6,7 +6,7 @@
 #include "wasp_string.h"
 #include "wasp_win32.h"
 
-#define PixelScale 8
+#define PixelScale 6
 #define WindowWidth 1280
 #define WindowHeight 720
 #define TilePixelSize PixelScale * 16
@@ -26,6 +26,13 @@ struct animation
     u32 Height;
 };
 
+struct collision_map
+{
+    u32 SizeX;
+    u32 SizeY;
+    b8 *Layout;
+};
+
 struct tile_map
 {
     u32 SizeX;
@@ -40,12 +47,32 @@ struct context
 {
     SDL_Surface *WindowSurface;
     SDL_Window *Window;
+
+    f32 PlayerX;
+    f32 PlayerY;
+
+    f32 DirectionX;
+    f32 DirectionY;
+
+    f32 MovementSpeed;
+
+    u32 Seed;
 };
 
 global context GlobalContext;
 
 internal void AssertCallback(char *Expression, char *File, int LineNumber, char *Function)
 {
+}
+
+internal u32
+GetRandom()
+{
+    u32 X = GlobalContext.Seed;
+	X ^= X << 13;
+	X ^= X >> 17;
+	X ^= X << 5;
+	return GlobalContext.Seed = X;
 }
 
 internal tile_map
@@ -56,10 +83,82 @@ TileMapCreate(memory_arena *Arena, u32 SizeX, u32 SizeY, animation *Animations, 
     Result.SizeX = SizeX;
     Result.SizeY = SizeY;
     Result.Layout = MemoryArenaPushArray(Arena, u8, 0, SizeX * SizeY);
+
     Result.Animations = MemoryArenaPushArray(Arena, animation, 0, AnimationsCount);
     Result.AnimationsCount = AnimationsCount;
 
+    MemoryCopy(Result.Animations, Animations, SizeOf(animation) * AnimationsCount);
+
     return(Result);
+}
+
+internal collision_map
+CollisionMapCreate(memory_arena *Arena, tile_map *TileMap, b8 *WalkableBlocks, u32 WalkableBlocksCount)
+{
+    collision_map Result = {};
+
+    Result.SizeX = TileMap->SizeX;
+    Result.SizeY = TileMap->SizeY;
+    Result.Layout = MemoryArenaPushArray(Arena, b8, 0, TileMap->SizeX * TileMap->SizeY);
+
+    for(u32 IndexY = 0;
+        IndexY < TileMap->SizeY;
+        IndexY++)
+    {
+        for(u32 IndexX = 0;
+            IndexX < TileMap->SizeX;
+            IndexX++)
+        {
+            b8 IsWalkable = 0;
+
+            for(u32 BlockIndex = 0;
+                BlockIndex < WalkableBlocksCount;
+                BlockIndex++)
+            {
+                if(WalkableBlocks[BlockIndex] == TileMap->Layout[IndexY * TileMap->SizeX + IndexX])
+                {
+                    IsWalkable = 1;
+                    break;
+                }
+            }
+
+            Result.Layout[IndexY * TileMap->SizeX + IndexX] = IsWalkable;
+        }
+    }
+
+    return(Result);
+}
+
+internal void
+CollisionMapIntersection(collision_map *CollisionMap, tile_map *TileMap, b8 *WalkableBlocks, u32 WalkableBlocksCount)
+{
+    for(u32 IndexY = 0;
+        IndexY < TileMap->SizeY;
+        IndexY++)
+    {
+        for(u32 IndexX = 0;
+            IndexX < TileMap->SizeX;
+            IndexX++)
+        {
+            if(CollisionMap->Layout[IndexY * TileMap->SizeX + IndexX] && TileMap->Layout[IndexY * TileMap->SizeX + IndexX])
+            {
+                b8 IsWalkable = 0;
+    
+                for(u32 BlockIndex = 0;
+                    BlockIndex < WalkableBlocksCount;
+                    BlockIndex++)
+                {
+                    if(WalkableBlocks[BlockIndex] == TileMap->Layout[IndexY * TileMap->SizeX + IndexX])
+                    {
+                        IsWalkable = 1;
+                        break;
+                    }
+                }
+    
+                CollisionMap->Layout[IndexY * TileMap->SizeX + IndexX] = IsWalkable;
+            }
+        }
+    }
 }
 
 internal texture
@@ -145,6 +244,128 @@ AnimationDraw(animation *Animation, u32 X, u32 Y, u32 Frame)
     TextureDraw(Texture, X, Y);
 }
 
+internal void
+TileMapDraw(tile_map *TileMap, u32 X, u32 Y, u32 Frame)
+{
+    u32 CurrentX = X;
+    u32 CurrentY = Y;
+
+    for(u32 IndexY = 0;
+        IndexY < TileMap->SizeY;
+        IndexY++)
+    {
+        for(u32 IndexX = 0;
+            IndexX < TileMap->SizeX;
+            IndexX++)
+        {
+            animation *Animation = &TileMap->Animations[TileMap->Layout[IndexY * TileMap->SizeX + IndexX]];
+
+            if(Animation->FramesCount)
+            {
+                AnimationDraw(Animation, CurrentX, CurrentY, Frame);
+            }
+
+            CurrentX += TilePixelSize;
+        }
+
+        CurrentY += TilePixelSize;
+        CurrentX = X;
+    }
+}
+
+internal void
+TileMapFillRandom(tile_map *TileMap, u32 X1, u32 Y1, u32 X2, u32 Y2, u8 First, u8 Count)
+{
+    u32 Pitch = TileMap->SizeX;
+    u32 RowStart = X1 + Y1 * TileMap->SizeX;
+
+    for(u32 Y = Y1;
+        Y < Y2;
+        Y++)
+    {
+        u32 CurrentElement = RowStart;
+        for(u32 X = X1;
+            X < X2;
+            X++)
+        {
+            f32 Clamped = (f32)GetRandom() / (f32)MaxU32;
+
+            u8 Type = 0;
+            while(Clamped < 0.33)
+            {
+                Type++;
+
+                if(Type >= Count - 1)
+                {
+                    break;
+                }
+
+                Clamped = (f32)GetRandom() / (f32)MaxU32;
+            }
+
+            TileMap->Layout[CurrentElement] = First + Type;
+
+            CurrentElement++;
+        }
+
+        RowStart += Pitch;
+    }
+}
+
+internal void
+TileMapFill(tile_map *TileMap, u32 X1, u32 Y1, u32 X2, u32 Y2, u8 Index)
+{
+    u32 Pitch = TileMap->SizeX;
+    u32 RowStart = X1 + Y1 * TileMap->SizeX;
+
+    for(u32 Y = Y1;
+        Y < Y2;
+        Y++)
+    {
+        u32 CurrentElement = RowStart;
+        for(u32 X = X1;
+            X < X2;
+            X++)
+        {
+            TileMap->Layout[CurrentElement] = Index;
+            CurrentElement++;
+        }
+
+        RowStart += Pitch;
+    }
+}
+
+internal void
+TileMapFillWithTexture(tile_map *TileMap, u32 X1, u32 Y1, u32 X2, u32 Y2, u8 First)
+{
+    u32 Pitch = TileMap->SizeX;
+    u32 RowStart = X1 + Y1 * TileMap->SizeX;
+    u8 Index = First;
+
+    for(u32 Y = Y1;
+        Y < Y2;
+        Y++)
+    {
+        u32 CurrentElement = RowStart;
+        for(u32 X = X1;
+            X < X2;
+            X++)
+        {
+            TileMap->Layout[CurrentElement] = Index++;
+            CurrentElement++;
+        }
+
+        RowStart += Pitch;
+    }
+}
+
+internal b8
+IsWalkable(collision_map *CollisionMap, u32 X, u32 Y)
+{
+    b8 Result = CollisionMap->Layout[Y * CollisionMap->SizeX + X];
+    return(Result);
+}
+
 s32 main(s32 ArgsCount, char **Args)
 {
     SDL_Init(SDL_INIT_VIDEO);
@@ -157,14 +378,137 @@ s32 main(s32 ArgsCount, char **Args)
     GlobalContext.Window = Window;
     GlobalContext.WindowSurface = WindowSurface;
 
-    animation Animation = AnimationCreate(&Arena, "assets/cuki_", 4);
+    animation CharacterAnimation = AnimationCreate(&Arena, "assets/cuki_", 4);
+    animation SeaAnimation = AnimationCreate(&Arena, "assets/sea", 16);
 
-    u32 FrameCounter = 0;
+    animation Grass0 = AnimationCreate(&Arena, "assets/tile_0", 1);
+    animation Grass1 = AnimationCreate(&Arena, "assets/tile_1", 1);
+    animation Grass2 = AnimationCreate(&Arena, "assets/tile_2", 1);
+    animation Grass3 = AnimationCreate(&Arena, "assets/tile_3", 1);
+    
+    animation ShallowWaterAnimation = AnimationCreate(&Arena, "assets/shallow_water", 4);
+
+    animation Collide0 = AnimationCreate(&Arena, "assets/collide0", 1);
+    animation Collide1 = AnimationCreate(&Arena, "assets/collide1", 1);
+    animation Collide2 = AnimationCreate(&Arena, "assets/collide2", 1);
+    animation Collide3 = AnimationCreate(&Arena, "assets/collide3", 1);
+    animation Collide4 = AnimationCreate(&Arena, "assets/collide4", 1);
+    animation Collide5 = AnimationCreate(&Arena, "assets/collide5", 1);
+    animation Collide6 = AnimationCreate(&Arena, "assets/collide6", 1);
+    animation Collide7 = AnimationCreate(&Arena, "assets/collide7", 1);
+
+    animation Temple0 = AnimationCreate(&Arena, "assets/temple_0", 1);
+    animation Temple1 = AnimationCreate(&Arena, "assets/temple_1", 1);
+    animation Temple2 = AnimationCreate(&Arena, "assets/temple_2", 1);
+    animation Temple3 = AnimationCreate(&Arena, "assets/temple_3", 1);
+    animation Temple4 = AnimationCreate(&Arena, "assets/temple_4", 1);
+    animation Temple5 = AnimationCreate(&Arena, "assets/temple_5", 1);
+    animation Temple6 = AnimationCreate(&Arena, "assets/temple_6", 1);
+    animation Temple7 = AnimationCreate(&Arena, "assets/temple_7", 1);
+    animation Temple8 = AnimationCreate(&Arena, "assets/temple_8", 1);
+    animation Temple9 = AnimationCreate(&Arena, "assets/temple_9", 1);
+    animation Temple10 = AnimationCreate(&Arena, "assets/temple_10", 1);
+    animation Temple11 = AnimationCreate(&Arena, "assets/temple_11", 1);
+    animation Temple12 = AnimationCreate(&Arena, "assets/temple_12", 1);
+
+    animation MapAnimations[] =
+    {
+        {},
+
+        SeaAnimation,
+        ShallowWaterAnimation,
+
+        Grass0, // 2
+        Grass1,
+        Grass2,
+        Grass3,
+
+        Collide0, // 6
+        Collide1,
+        Collide2,
+        Collide3,
+        Collide4,
+        Collide5,
+        Collide6,
+        Collide7,
+
+        {}, // 14
+        Temple0,
+        Temple1,
+        {},
+
+        Temple2, // 18
+        Temple3,
+        Temple4,
+        {},
+
+        Temple5, // 22
+        Temple6,
+        Temple7,
+        Temple8,
+
+        Temple9, // 26
+        Temple10,
+        Temple11,
+        Temple12,
+    };
+
+    b8 WalkableBlocks[] = 
+    {
+        3, 4, 5, 6,
+    };
+
+    GlobalContext.Seed = 1847569;
+
+    u32 MapSizeX = 24;
+    u32 MapSizeY = 24;
+    u32 MapMargin = 8;
+
+    tile_map IslandMap = TileMapCreate(&Arena, MapSizeX, MapSizeY, MapAnimations, ArrayCount(MapAnimations));
+    tile_map SeaMap = TileMapCreate(&Arena, MapSizeX, MapSizeY, MapAnimations, ArrayCount(MapAnimations));
+    tile_map OverlayMap = TileMapCreate(&Arena, MapSizeX, MapSizeY, MapAnimations, ArrayCount(MapAnimations));
+
+    TileMapFill(&SeaMap, 0, 0, MapSizeX, MapSizeY, 1);
+
+    TileMapFillRandom(&IslandMap, MapMargin, MapMargin, MapSizeX - MapMargin, MapSizeY - MapMargin, 3, 4);
+
+    TileMapFill(&IslandMap, MapMargin - 1, MapMargin, MapMargin, MapSizeY - MapMargin, 7 + 3);
+    TileMapFill(&IslandMap, MapSizeX - MapMargin, MapMargin, MapSizeX - MapMargin + 1, MapSizeY - MapMargin, 7 + 4);
+
+    TileMapFill(&IslandMap, MapMargin, MapMargin - 1, MapSizeY - MapMargin, MapMargin, 7 + 1);
+    TileMapFill(&IslandMap, MapMargin, MapSizeY - MapMargin, MapSizeY - MapMargin, MapSizeY - MapMargin + 1, 7 + 6);
+
+    TileMapFill(&IslandMap, MapMargin - 1, MapMargin - 1, MapMargin, MapMargin, 7 + 0);
+    TileMapFill(&IslandMap, MapSizeY - MapMargin, MapMargin - 1, MapSizeY - MapMargin + 1, MapMargin, 7 + 2);
+
+    TileMapFill(&IslandMap, MapMargin - 1, MapSizeY - MapMargin, MapMargin, MapSizeY - MapMargin + 1, 7 + 5);
+    TileMapFill(&IslandMap, MapSizeY - MapMargin, MapSizeY - MapMargin, MapSizeY - MapMargin + 1, MapSizeY - MapMargin + 1, 7 + 7);
+
+    TileMapFillWithTexture(&OverlayMap, MapSizeY / 2 - 2, MapMargin - 3, MapSizeY / 2 + 2, MapMargin + 1, 15);
+
+    collision_map CollisionMap = CollisionMapCreate(&Arena, &IslandMap, WalkableBlocks, ArrayCount(WalkableBlocks));
+    CollisionMapIntersection(&CollisionMap, &OverlayMap, WalkableBlocks, ArrayCount(WalkableBlocks));
+
     u32 SlowAnimFrame = 0;
+    u32 FastAnimFrame = 0;
+
+    GlobalContext.PlayerX = MapMargin + 0.5f;
+    GlobalContext.PlayerY = MapMargin + 0.5f;
+
+    u64 StartTime = SDL_GetPerformanceCounter();
+    u64 LastTime = StartTime;
+
+    GlobalContext.MovementSpeed = 15.0f;
     
     b32 Running = 1;
     while(Running)
     {
+        u64 CurrentTime = SDL_GetPerformanceCounter();
+        u64 Frequency = SDL_GetPerformanceFrequency();
+
+        f32 DeltaTime = (f32)(CurrentTime - LastTime) / (f32)Frequency;
+        f32 Time = (f32)(CurrentTime - StartTime) / (f32)Frequency;
+
         SDL_Event Event;
         while(SDL_PollEvent(&Event))
         {
@@ -172,19 +516,113 @@ s32 main(s32 ArgsCount, char **Args)
             {
                 Running = 0;
             }
+
+            if(!Event.key.repeat)
+            {
+
+                if(Event.type == SDL_EVENT_KEY_UP)
+                {
+                    switch(Event.key.key)
+                    {
+                        case 'w':
+                        {
+                            GlobalContext.DirectionY += 1;
+                        } break;
+    
+                        case 's':
+                        {
+                            GlobalContext.DirectionY -= 1;
+                        } break;
+    
+                        case 'd':
+                        {
+                            GlobalContext.DirectionX -= 1;
+                        } break;
+    
+                        case 'a':
+                        {
+                            GlobalContext.DirectionX += 1;
+                        } break;
+                    }
+                }
+    
+                if(Event.type == SDL_EVENT_KEY_DOWN)
+                {
+                    switch(Event.key.key)
+                    {
+                        case 'w':
+                        {
+                            GlobalContext.DirectionY -= 1;
+                        } break;
+    
+                        case 's':
+                        {
+                            GlobalContext.DirectionY += 1;
+                        } break;
+    
+                        case 'd':
+                        {
+                            GlobalContext.DirectionX += 1;
+                        } break;
+    
+                        case 'a':
+                        {
+                            GlobalContext.DirectionX -= 1;
+                        } break;
+                    }
+                }
+            }
+        }
+
+        GlobalContext.PlayerX += GlobalContext.DirectionX * DeltaTime * GlobalContext.MovementSpeed;
+        if(GlobalContext.DirectionX > 0.0f)
+        {
+            if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
+            {
+                GlobalContext.PlayerX = (u32)GlobalContext.PlayerX - 0.01f;
+            }
+        }
+        else if(GlobalContext.DirectionX < 0.0f)
+        {
+            if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
+            {
+                GlobalContext.PlayerX = (u32)GlobalContext.PlayerX + 1.0f;
+            }
+        }
+        
+        GlobalContext.PlayerY += GlobalContext.DirectionY * DeltaTime * GlobalContext.MovementSpeed;
+        if(GlobalContext.DirectionY > 0.0f)
+        {
+            if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
+            {
+                GlobalContext.PlayerY = (f32)(u32)GlobalContext.PlayerY - 0.01f;
+            }
+        }
+        else if(GlobalContext.DirectionY < 0.0f)
+        {
+            if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
+            {
+                GlobalContext.PlayerY = (u32)GlobalContext.PlayerY + 1.0f;
+            }
         }
 
         SDL_ClearSurface(WindowSurface, 0, 0, 0, 1);
 
-        AnimationDraw(&Animation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize / 2, SlowAnimFrame);
+        u32 TileMapX = (u32)(-GlobalContext.PlayerX * TilePixelSize + WindowWidth / 2);
+        u32 TileMapY = (u32)(-GlobalContext.PlayerY * TilePixelSize + WindowHeight / 2);
+
+        TileMapDraw(&SeaMap, TileMapX, TileMapY, FastAnimFrame);
+        TileMapDraw(&IslandMap, TileMapX, TileMapY, FastAnimFrame);
+        TileMapDraw(&OverlayMap, TileMapX, TileMapY, FastAnimFrame);
+
+        AnimationDraw(&CharacterAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
 
         SDL_UpdateWindowSurface(Window);
 
-        FrameCounter++;
-        if(FrameCounter % 100 == 0)
-        {
-            SlowAnimFrame++;
-        }
+        SlowAnimFrame = (u32)(Time * 2);
+        FastAnimFrame = (u32)(Time * 3);
+
+        LastTime = CurrentTime;
     }
 
     SDL_Quit();
