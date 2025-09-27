@@ -1,7 +1,16 @@
-#include <SDL3/SDL.h>
-#include <iostream>
-using namespace std;
+#include "wasp.h"
+#include "wasp_math.h"
+#include "wasp_memory.h"
+#include "wasp_win32.h"
 
+#include <SDL3/SDL.h>
+
+s32 main(s32 ArgsCount, char **Args)
+{
+    return(0);
+}
+
+#if 0
 SDL_Window* gWindow = NULL; 
 SDL_Surface* gScreenSurface = NULL;
 SDL_Surface* gHelloWorld = NULL;
@@ -55,3 +64,4 @@ void close()
 
     SDL_Quit();
 }
+#endif
