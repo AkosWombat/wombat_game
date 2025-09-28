@@ -79,16 +79,31 @@ struct context
     f32 PlayerX;
     f32 PlayerY;
 
+    b32 IsPointer;
+
     f32 DirectionX;
     f32 DirectionY;
 
+    u32 GameState;
+    b32 ShopOpen;
+
+    u32 MultishotLevel;
+    u32 FasterRegenLevel;
+    u32 MaxHealthLevel;
+
     f32 MovementSpeed;
-    f32 EnemySpeed;
+    f32 MovementSpeedMultiplier;
+    f32 RegenLimit;
+    f32 FireEnemySpeed;
+    f32 WaterEnemySpeed;
     u32 ProjectileDamage;
     f32 ProjectileSpeed;
-    f32 FireRate;
-    f32 FireRateRandomFactor;
+    f32 FireFireRate;
+    f32 FireFireRateRandomFactor;
+    f32 WaterFireRate;
+    f32 WaterFireRateRandomFactor;
     f32 WaveCooldown;
+    f32 ShotCooldown;
 
     u32 Seed;
 
@@ -100,15 +115,23 @@ struct context
     projectile Projectiles;
     projectile FreeProjectiles;
 
-    u32 Health;
-    u32 MaxHealth;
+    f32 RegenRate;
+
+    f32 ShotHealthCost;
+    f32 Health;
+    f32 MaxHealth;
+    u32 MultishotCount;
+    u32 MultishotAngleDifference;
 
     f32 TimeOfLastRegenerate;
     f32 TimeOfLastWaveEnd;
+    f32 TimeOfLastShot;
     b32 IsWaitingForNextWave;
     u32 WaveIndex;
 
     v2 ViewDirection;
+    u32 MouseX;
+    u32 MouseY;
 };
 
 global context GlobalContext;
@@ -532,7 +555,7 @@ IsWalkable(collision_map *CollisionMap, u32 X, u32 Y)
 }
 
 internal void
-SpawnEnemies(u32 Count, f32 X, f32 Y, f32 Radius)
+SpawnEnemies(u32 Count, f32 X, f32 Y, f32 Radius, f32 Time)
 {
     GlobalContext.EnemiesCount = Count;
     GlobalContext.EnemiesRemaining = Count;
@@ -542,10 +565,22 @@ SpawnEnemies(u32 Count, f32 X, f32 Y, f32 Radius)
         Index++)
     {
         GlobalContext.Enemies[Index].Type = GetRandom() % 2;
+        GlobalContext.Enemies[Index].Dead = 0;
 
-        f32 RandomAngle = (f32)GetRandom() / (f32)MaxU32 * 2 * Pi;
+        f32 RandomAngle = ((f32)GetRandom() / (f32)MaxU32) * 2.0f * Pi;
 
-        GlobalContext.Enemies[Index].Position = V2(Cos(RandomAngle) * Radius + X, Abs(Sin(RandomAngle)) * Radius + Y);
+        f32 R = ((f32)GetRandom() / (f32)MaxU32) * Radius;
+
+        GlobalContext.Enemies[Index].Position = V2(Cos(RandomAngle) * R + X, Abs(Sin(RandomAngle)) * R + Y);
+
+        if(GlobalContext.Enemies[Index].Type == 0)
+        {
+            GlobalContext.Enemies[Index].TimeOfNextShot = Time + GlobalContext.FireFireRate + GlobalContext.FireFireRateRandomFactor * (f32)GetRandom() / (f32)MaxU32;
+        }
+        else
+        {
+            GlobalContext.Enemies[Index].TimeOfNextShot = Time + GlobalContext.WaterFireRate + GlobalContext.WaterFireRateRandomFactor * (f32)GetRandom() / (f32)MaxU32;
+        }
     }
 }
 
@@ -582,16 +617,16 @@ ProjectileSpawn(v2 Position, v2 Velocity, b32 IsEnemy, u32 Type)
 internal b32
 LineIntersection(f32 X1, f32 Y1, f32 X2, f32 Y2,
                     f32 X3, f32 Y3, f32 X4, f32 Y4) {
-    f32 Denom = (X1 - X2) * (Y3 - Y4) - (Y1 - Y2) * (X3 - X4);
-    if (Denom == 0.0f)
-    {
-        return false;
+    float denom = (Y4 - Y3) * (X2 - X1) - (X4 - X3) * (Y2 - Y1);
+
+    if (denom == 0.0f) {
+        return false; // Lines are parallel
     }
 
-    f32 T = ((X1 - X3) * (Y3 - Y4) - (Y1 - Y3) * (X3 - X4)) / Denom;
-    f32 U = ((X1 - X3) * (Y1 - Y2) - (Y1 - Y3) * (X1 - X2)) / Denom;
+    float ua = ((X4 - X3) * (Y1 - Y3) - (Y4 - Y3) * (X1 - X3)) / denom;
+    float ub = ((X2 - X1) * (Y1 - Y3) - (Y2 - Y1) * (X1 - X3)) / denom;
 
-    return (T >= 0 && T <= 1 && U >= 0 && U <= 1);
+    return (ua >= 0.0f && ua <= 1.0f && ub >= 0.0f && ub <= 1.0f);
 }
 
 internal b32
@@ -660,14 +695,8 @@ ProjectileUpdate(f32 DeltaTime)
             {
                 ShouldDelete = 1;
 
-                if(GlobalContext.Health > GlobalContext.ProjectileDamage)
-                {
-                    GlobalContext.Health -= GlobalContext.ProjectileDamage;
-                }
-                else
-                {
-                    GlobalContext.Health = 0;
-                }
+                GlobalContext.Health -= GlobalContext.ProjectileDamage;
+                if(GlobalContext.Health < 0) GlobalContext.Health = 0;
             }
         }
         else
@@ -677,21 +706,24 @@ ProjectileUpdate(f32 DeltaTime)
                 EnemyIndex++)
             {
                 enemy *Enemy = &GlobalContext.Enemies[EnemyIndex];
-    
-                if(RectLineIntersection(
-                    Enemy->Position.X - 0.5f,
-                    Enemy->Position.X - 0.5f,
-                    1.0f,
-                    1.0f,
-                    Projectile->LastPosition.X,
-                    Projectile->LastPosition.Y,
-                    Projectile->Position.X,
-                    Projectile->Position.Y))
+
+                if(!Enemy->Dead)
                 {
-                    ShouldDelete = 1;
-                    
-                    Enemy->Dead = 1;
-                    GlobalContext.EnemiesRemaining--;
+                    if(RectLineIntersection(
+                        Enemy->Position.X - 0.5f,
+                        Enemy->Position.Y - 0.5f,
+                        1.0f,
+                        1.0f,
+                        Projectile->LastPosition.X,
+                        Projectile->LastPosition.Y,
+                        Projectile->Position.X,
+                        Projectile->Position.Y))
+                    {
+                        ShouldDelete = 1;
+                        
+                        Enemy->Dead = 1;
+                        GlobalContext.EnemiesRemaining--;
+                    }
                 }
             }
         }
@@ -724,13 +756,14 @@ s32 main(s32 ArgsCount, char **Args)
 
     memory_arena Arena = MemoryArenaCreate(0, MB(8), 0);
 
-    SDL_Window *Window = SDL_CreateWindow("Wombat", WindowWidth, WindowHeight, 0);
+    SDL_Window *Window = SDL_CreateWindow("RoboElemental", WindowWidth, WindowHeight, 0);
     SDL_Surface *WindowSurface = SDL_GetWindowSurface(Window);
 
     GlobalContext.Window = Window;
     GlobalContext.WindowSurface = WindowSurface;
 
-    animation CharacterAnimation = AnimationCreate(&Arena, "assets/cuki_", 4);
+    animation CharacterIdleAnimation = AnimationCreate(&Arena, "assets/bot_idle_", 1);
+    animation CharacterWalkingAnimation = AnimationCreate(&Arena, "assets/bot_walking_", 2);
     animation SeaAnimation = AnimationCreate(&Arena, "assets/sea", 16);
 
     animation Grass0 = AnimationCreate(&Arena, "assets/tile_0", 1);
@@ -766,10 +799,23 @@ s32 main(s32 ArgsCount, char **Args)
     texture BlankHealthBar = TextureCreate("assets/blank_health_bar.bmp");
     texture HealthBar = TextureCreate("assets/health_bar.bmp");
 
+    texture StartOn = TextureCreate("assets/start_on.bmp");
+    texture StartOff = TextureCreate("assets/start_off.bmp");
+
+    texture GameOver = TextureCreate("assets/gameover.bmp");
+    texture WinMenu = TextureCreate("assets/win_menu0.bmp");
+
+    texture ShopUI = TextureCreate("assets/shopui.bmp");
+    animation MaxHealth = AnimationCreate(&Arena, "assets/maxhealthlevel", 5);
+    animation FasterRegen = AnimationCreate(&Arena, "assets/fasterregen", 5);
+    animation Multishot = AnimationCreate(&Arena, "assets/multishot", 5);
+
     animation Fire = AnimationCreate(&Arena, "assets/fire", 1);
     animation Water = AnimationCreate(&Arena, "assets/water", 1);
 
     animation Ball = AnimationCreate(&Arena, "assets/ball", 1);
+    animation FireBall = AnimationCreate(&Arena, "assets/fireball", 1);
+    animation WaterBall = AnimationCreate(&Arena, "assets/waterball", 1);
 
     animation Enemies[] =
     {
@@ -778,7 +824,7 @@ s32 main(s32 ArgsCount, char **Args)
 
     animation Projectiles[] =
     {
-        Ball
+        Ball, FireBall, WaterBall
     };
 
     animation MapAnimations[] =
@@ -830,8 +876,8 @@ s32 main(s32 ArgsCount, char **Args)
 
     GlobalContext.Seed = 1847569;
 
-    u32 MapSizeX = 24;
-    u32 MapSizeY = 24;
+    u32 MapSizeX = 28;
+    u32 MapSizeY = 28;
     u32 MapMargin = 8;
 
     tile_map IslandMap = TileMapCreate(&Arena, MapSizeX, MapSizeY, MapAnimations, ArrayCount(MapAnimations));
@@ -869,22 +915,36 @@ s32 main(s32 ArgsCount, char **Args)
     u64 LastTime = StartTime;
 
     GlobalContext.MovementSpeed = 5.0f;
-    GlobalContext.EnemySpeed = 2.0f;
+    GlobalContext.FireEnemySpeed = 2.0f;
+    GlobalContext.WaterEnemySpeed = 0.75f;
 
     GlobalContext.EnemiesCapacity = 1024;
     GlobalContext.Enemies = MemoryArenaPushArray(&Arena, enemy, 0, GlobalContext.EnemiesCapacity);
     
-    GlobalContext.MaxHealth = 100;
-    GlobalContext.Health = 100;
+    GlobalContext.MaxHealth = 100.0f;
+    GlobalContext.Health = 100.0f;
     GlobalContext.ProjectileDamage = 3;
     GlobalContext.ProjectileSpeed = 7.0f;
-    GlobalContext.FireRate = 1.4f;
-    GlobalContext.FireRateRandomFactor = 0.8f;
+    GlobalContext.FireFireRate = 1.4f;
+    GlobalContext.FireFireRateRandomFactor = 0.8f;
+    GlobalContext.WaterFireRate = 0.9f;
+    GlobalContext.WaterFireRateRandomFactor = 0.6f;
     GlobalContext.WaveCooldown = 8.0f;
+    GlobalContext.RegenRate = 2;
+    GlobalContext.ShotHealthCost = 4;
+    GlobalContext.MultishotCount = 3;
+    GlobalContext.MultishotAngleDifference = 5;
+    GlobalContext.ShotCooldown = 0.2f;
+    GlobalContext.MovementSpeedMultiplier = 1.0f;
+    GlobalContext.RegenLimit = 0.6f;
+    GlobalContext.GameState = 0;
 
     font Font = FontCreate("assets/fontatlas2.bmp", 5, 5);
 
     InitProjectiles(&Arena, 128);
+
+    SDL_Cursor* PointerCursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
+    SDL_Cursor* ArrowCursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
     
     b32 Running = 1;
     while(Running)
@@ -893,10 +953,12 @@ s32 main(s32 ArgsCount, char **Args)
         u64 Frequency = SDL_GetPerformanceFrequency();
 
         f32 DeltaTime = (f32)(CurrentTime - LastTime) / (f32)Frequency;
+        if(DeltaTime > 1.0f) DeltaTime = 1.0f;
         f32 Time = (f32)(CurrentTime - StartTime) / (f32)Frequency;
 
-        b32 ShouldShoot = 0;
+        b32 DidClick = 0;
         b32 ShouldRestart = 0;
+        b32 PressedSpace = 0;
 
         SDL_Event Event;
         while(SDL_PollEvent(&Event))
@@ -963,6 +1025,11 @@ s32 main(s32 ArgsCount, char **Args)
                         {
                             ShouldRestart = 1;
                         } break;
+
+                        case ' ':
+                        {
+                            PressedSpace = 1;
+                        } break;
                     }
                 }
             }
@@ -970,148 +1037,386 @@ s32 main(s32 ArgsCount, char **Args)
             if(Event.type == SDL_EVENT_MOUSE_MOTION)
             {
                 GlobalContext.ViewDirection = Normalize(V2(Event.motion.x, Event.motion.y) - V2(WindowWidth / 2.0f, WindowHeight / 2.0f));
+
+                GlobalContext.MouseX = (u32)Event.motion.x;
+                GlobalContext.MouseY = (u32)Event.motion.y;
             }
 
             if(Event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && Event.button.button == SDL_BUTTON_LEFT)
             {
-                ShouldShoot = 1;
-            }
-        }
-
-        f32 VelocityX = GlobalContext.DirectionX * DeltaTime * GlobalContext.MovementSpeed;
-
-        GlobalContext.PlayerX += GlobalContext.DirectionX * DeltaTime * GlobalContext.MovementSpeed;
-        if(GlobalContext.DirectionX > 0.0f)
-        {
-            if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
-            {
-                GlobalContext.PlayerX = (u32)GlobalContext.PlayerX - 0.01f;
-                VelocityX = 0.0f;
-            }
-        }
-        else if(GlobalContext.DirectionX < 0.0f)
-        {
-            if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
-            {
-                GlobalContext.PlayerX = (u32)GlobalContext.PlayerX + 1.0f;
-                VelocityX = 0.0f;
-            }
-        }
-
-        f32 VelocityY = GlobalContext.DirectionY * DeltaTime * GlobalContext.MovementSpeed;
-        
-        GlobalContext.PlayerY += GlobalContext.DirectionY * DeltaTime * GlobalContext.MovementSpeed;
-        if(GlobalContext.DirectionY > 0.0f)
-        {
-            if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
-            {
-                GlobalContext.PlayerY = (f32)(u32)GlobalContext.PlayerY - 0.01f;
-                VelocityY = 0.0f;
-            }
-        }
-        else if(GlobalContext.DirectionY < 0.0f)
-        {
-            if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
-            {
-                GlobalContext.PlayerY = (u32)GlobalContext.PlayerY + 1.0f;
-                VelocityY = 0.0f;
+                DidClick = 1;
             }
         }
 
         SDL_ClearSurface(WindowSurface, 0, 0, 0, 1);
 
-        u32 TileMapX = (u32)(-GlobalContext.PlayerX * TilePixelSize + WindowWidth / 2);
-        u32 TileMapY = (u32)(-GlobalContext.PlayerY * TilePixelSize + WindowHeight / 2);
-
-        TileMapDraw(&SeaMap, TileMapX, TileMapY, FastAnimFrame);
-        TileMapDraw(&IslandMap, TileMapX, TileMapY, FastAnimFrame);
-        TileMapDraw(&OverlayMap, TileMapX, TileMapY, FastAnimFrame);
-
-        b32 ShouldRegenerateAngle = 0;
-        if(GlobalContext.TimeOfLastRegenerate + 1.0f < Time)
+        switch(GlobalContext.GameState)
         {
-            ShouldRegenerateAngle = 1;
-            GlobalContext.TimeOfLastRegenerate = Time;
-        }
-
-        for(u32 Index = 0;
-            Index < GlobalContext.EnemiesCount;
-            Index++)
-        {
-            enemy *Enemy = &GlobalContext.Enemies[Index];
-
-            if(!Enemy->Dead)
+            case 0:
             {
-                animation *Animation = &Enemies[Enemy->Type];
-    
-                v2 Transformed = GetScreenPos(Enemy->Position);
-                AnimationDraw(Animation, (u32)Transformed.X - TilePixelSize / 2, (u32)Transformed.Y - TilePixelSize / 2, SlowAnimFrame);
-    
-                v2 Target = V2(GlobalContext.PlayerX + Cos(Enemy->Angle) * 3, GlobalContext.PlayerY + Sin(Enemy->Angle) * 3);
-    
-                v2 Delta = Normalize(Target - V2(Enemy->Position.X, Enemy->Position.Y)) * GlobalContext.EnemySpeed * DeltaTime;
-                Enemy->Position.X += Delta.X;
-                Enemy->Position.Y += Delta.Y;
-    
-                if(ShouldRegenerateAngle)
+                u32 TileMapX = (u32)(-GlobalContext.PlayerX * TilePixelSize + WindowWidth / 2);
+                u32 TileMapY = (u32)(-GlobalContext.PlayerY * TilePixelSize + WindowHeight / 2);
+
+                TileMapDraw(&SeaMap, TileMapX, TileMapY, FastAnimFrame);
+                TileMapDraw(&IslandMap, TileMapX, TileMapY, FastAnimFrame);
+                TileMapDraw(&OverlayMap, TileMapX, TileMapY, FastAnimFrame);
+
+                AnimationDraw(&CharacterIdleAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
+
+                u32 ButtonLeftX = 40;
+                u32 ButtonRightX = 189;
+                u32 ButtonTopY = 40;
+                u32 ButtonBottomY = 85;
+
+                u32 TopLeftX = WindowWidth / 2 - PixelScale * StartOff.Width / 2;
+                u32 TopLeftY = WindowHeight / 2 - PixelScale * StartOff.Height / 2;
+
+                if(GlobalContext.MouseX >= TopLeftX + ButtonLeftX * PixelScale && GlobalContext.MouseX <= TopLeftX + ButtonRightX * PixelScale && 
+                    GlobalContext.MouseY >= TopLeftY + ButtonTopY * PixelScale && GlobalContext.MouseY <= TopLeftY + ButtonBottomY * PixelScale)
                 {
-                    Enemy->Angle = (f32)GetRandom() / (f32)MaxU32 * 2 * Pi;
+                    TextureDrawCustom(&StartOn, WindowWidth / 2 - PixelScale * StartOff.Width / 2, WindowHeight / 2 - PixelScale * StartOff.Height / 2);
+
+                    GlobalContext.IsPointer = 1;
+
+                    if(DidClick)
+                    {
+                        ShouldRestart = 1;
+                    }
                 }
-    
-                if(Time > Enemy->TimeOfNextShot)
+                else
                 {
-                    Enemy->TimeOfNextShot = Time + GlobalContext.FireRate + GlobalContext.FireRateRandomFactor * (f32)GetRandom() / (f32)MaxU32;
-    
-                    v2 ShotDelta = Normalize(V2(GlobalContext.PlayerX, GlobalContext.PlayerY) - Enemy->Position) * GlobalContext.ProjectileSpeed;
-    
-                    ProjectileSpawn(Enemy->Position, ShotDelta, 1, 0);
+                    TextureDrawCustom(&StartOff, WindowWidth / 2 - PixelScale * StartOff.Width / 2, WindowHeight / 2 - PixelScale * StartOff.Height / 2);
                 }
-            }
+
+            } break;
+
+            case 1:
+            {
+                f32 VelocityX = 0.0f;
+                f32 VelocityY = 0.0f;
+
+                if(!GlobalContext.ShopOpen)
+                {
+                    VelocityX = GlobalContext.DirectionX * DeltaTime * GlobalContext.MovementSpeed * GlobalContext.MovementSpeedMultiplier;
+    
+                    GlobalContext.PlayerX += GlobalContext.DirectionX * DeltaTime * GlobalContext.MovementSpeed * GlobalContext.MovementSpeedMultiplier;
+                    if(GlobalContext.DirectionX > 0.0f)
+                    {
+                        if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
+                        {
+                            GlobalContext.PlayerX = (u32)GlobalContext.PlayerX - 0.01f;
+                            VelocityX = 0.0f;
+                        }
+                    }
+                    else if(GlobalContext.DirectionX < 0.0f)
+                    {
+                        if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
+                        {
+                            GlobalContext.PlayerX = (u32)GlobalContext.PlayerX + 1.0f;
+                            VelocityX = 0.0f;
+                        }
+                    }
+    
+                    VelocityY = GlobalContext.DirectionY * DeltaTime * GlobalContext.MovementSpeed * GlobalContext.MovementSpeedMultiplier;
+                    
+                    GlobalContext.PlayerY += GlobalContext.DirectionY * DeltaTime * GlobalContext.MovementSpeed * GlobalContext.MovementSpeedMultiplier;
+                    if(GlobalContext.DirectionY > 0.0f)
+                    {
+                        if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
+                        {
+                            GlobalContext.PlayerY = (f32)(u32)GlobalContext.PlayerY - 0.01f;
+                            VelocityY = 0.0f;
+                        }
+                    }
+                    else if(GlobalContext.DirectionY < 0.0f)
+                    {
+                        if(!IsWalkable(&CollisionMap, (u32)GlobalContext.PlayerX, (u32)GlobalContext.PlayerY))
+                        {
+                            GlobalContext.PlayerY = (u32)GlobalContext.PlayerY + 1.0f;
+                            VelocityY = 0.0f;
+                        }
+                    }
+                }
+
+                GlobalContext.MaxHealth = 100 + GlobalContext.MaxHealthLevel * 10.0f;
+                GlobalContext.MovementSpeedMultiplier = 1.0f - GlobalContext.MaxHealthLevel * 0.20f;
+
+                GlobalContext.RegenRate = 2.0f + GlobalContext.FasterRegenLevel * 1.0f;
+                GlobalContext.RegenLimit = 0.8f - GlobalContext.FasterRegenLevel * 0.1f;
+
+                GlobalContext.MultishotCount = GlobalContext.MultishotLevel + 1;
+                GlobalContext.ShotCooldown = 0.2f + GlobalContext.MultishotLevel * 0.6f;
+
+                u32 TileMapX = (u32)(-GlobalContext.PlayerX * TilePixelSize + WindowWidth / 2);
+                u32 TileMapY = (u32)(-GlobalContext.PlayerY * TilePixelSize + WindowHeight / 2);
+
+                TileMapDraw(&SeaMap, TileMapX, TileMapY, FastAnimFrame);
+                TileMapDraw(&IslandMap, TileMapX, TileMapY, FastAnimFrame);
+                TileMapDraw(&OverlayMap, TileMapX, TileMapY, FastAnimFrame);
+
+                b32 ShouldRegenerateAngle = 0;
+                if(GlobalContext.TimeOfLastRegenerate + 1.0f < Time)
+                {
+                    ShouldRegenerateAngle = 1;
+                    GlobalContext.TimeOfLastRegenerate = Time;
+                }
+
+                for(u32 Index = 0;
+                    Index < GlobalContext.EnemiesCount;
+                    Index++)
+                {
+                    enemy *Enemy = &GlobalContext.Enemies[Index];
+
+                    if(!Enemy->Dead)
+                    {
+                        animation *Animation = &Enemies[Enemy->Type];
+            
+                        v2 Transformed = GetScreenPos(Enemy->Position);
+                        AnimationDraw(Animation, (u32)Transformed.X - TilePixelSize / 2, (u32)Transformed.Y - TilePixelSize / 2, SlowAnimFrame);
+            
+                        v2 Target = V2(GlobalContext.PlayerX + Cos(Enemy->Angle) * 3, GlobalContext.PlayerY + Sin(Enemy->Angle) * 3);
+                        
+                        v2 Delta = Normalize(Target - V2(Enemy->Position.X, Enemy->Position.Y)) * DeltaTime;
+                        if(Enemy->Type == 0)
+                        {
+                            Delta *= GlobalContext.FireEnemySpeed;
+                        }
+                        else
+                        {
+                            Delta *= GlobalContext.WaterEnemySpeed;
+                        }
+                        Enemy->Position.X += Delta.X;
+                        Enemy->Position.Y += Delta.Y;
+            
+                        if(ShouldRegenerateAngle)
+                        {
+                            Enemy->Angle = (f32)GetRandom() / (f32)MaxU32 * 2 * Pi;
+                        }
+            
+                        if(Time > Enemy->TimeOfNextShot)
+                        {
+                            if(Enemy->Type == 0)
+                            {
+                                Enemy->TimeOfNextShot = Time + GlobalContext.FireFireRate + GlobalContext.FireFireRateRandomFactor * (f32)GetRandom() / (f32)MaxU32;
+                            }
+                            else
+                            {
+                                Enemy->TimeOfNextShot = Time + GlobalContext.WaterFireRate + GlobalContext.WaterFireRateRandomFactor * (f32)GetRandom() / (f32)MaxU32;
+                            }
+            
+                            v2 ShotDelta = Normalize(V2(GlobalContext.PlayerX, GlobalContext.PlayerY) - Enemy->Position) * GlobalContext.ProjectileSpeed;
+            
+                            ProjectileSpawn(Enemy->Position, ShotDelta, 1, Enemy->Type == 0 ? 1 : 2);
+                        }
+                    }
+                }
+
+                if(GlobalContext.Health <= GlobalContext.MaxHealth * GlobalContext.RegenLimit)
+                {
+                    GlobalContext.Health += DeltaTime * GlobalContext.RegenRate;
+                    if(GlobalContext.Health > GlobalContext.MaxHealth * GlobalContext.RegenLimit)
+                    {
+                        GlobalContext.Health = GlobalContext.MaxHealth * GlobalContext.RegenLimit;
+                    }
+                }
+                
+                ProjectileUpdate(DeltaTime);
+                
+                if(!GlobalContext.Health)
+                {
+                    GlobalContext.GameState = 3;
+                }
+
+                for(projectile *Projectile = GlobalContext.Projectiles.Next;
+                    Projectile != &GlobalContext.Projectiles;
+                    Projectile = Projectile->Next)
+                    {
+                        v2 Transformed = GetScreenPos(Projectile->Position);
+                    animation *Animation = &Projectiles[Projectile->Type];
+                    AnimationDraw(Animation, (u32)Transformed.X - TilePixelSize / 2, (u32)Transformed.Y - TilePixelSize / 2, SlowAnimFrame);
+                }
+
+                if(DidClick && GlobalContext.Health > GlobalContext.ShotHealthCost && GlobalContext.TimeOfLastShot + GlobalContext.ShotCooldown < Time)
+                {
+                    GlobalContext.TimeOfLastShot = Time;
+                    GlobalContext.Health -= GlobalContext.ShotHealthCost;
+
+                    f32 Angle = -(GlobalContext.MultishotCount - 1.0f) * 0.5f * GlobalContext.MultishotAngleDifference;
+
+                    for(u32 ProjectileIndex = 0;
+                        ProjectileIndex < GlobalContext.MultishotCount;
+                        ProjectileIndex++)
+                    {
+                        v2 Direction = GlobalContext.ViewDirection * GlobalContext.ProjectileSpeed;
+                        v2 Rotated = V2Rotate(Direction, Angle);
+                        
+                        ProjectileSpawn(V2(GlobalContext.PlayerX, GlobalContext.PlayerY) + V2(VelocityX, VelocityY), Rotated, 0, 0);
+
+                        Angle += GlobalContext.MultishotAngleDifference;
+                    }
+
+                }
+
+                if(GlobalContext.EnemiesRemaining == 0 && !GlobalContext.IsWaitingForNextWave)
+                {
+                    GlobalContext.TimeOfLastWaveEnd = Time;
+                    GlobalContext.IsWaitingForNextWave = 1;
+                    
+                    if(GlobalContext.WaveIndex == 10)
+                    {
+                        GlobalContext.GameState = 2;
+                    }
+                }
+
+                if(GlobalContext.IsWaitingForNextWave && GlobalContext.TimeOfLastWaveEnd + GlobalContext.WaveCooldown < Time)
+                {
+                    GlobalContext.IsWaitingForNextWave = 0;
+
+                    SpawnEnemies((GlobalContext.WaveIndex + 1) * 2 + GetRandom() % 2, CollisionMap.SizeX / 2.0f, CollisionMap.SizeY / 2.0f, 7, Time);
+
+                    GlobalContext.WaveIndex++;
+                }
+
+                if(GlobalContext.DirectionX != 0 || GlobalContext.DirectionY != 0)
+                {
+                    AnimationDraw(&CharacterWalkingAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
+                }
+                else{
+                    AnimationDraw(&CharacterIdleAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
+                }
+
+                TextureDrawCustomPartial(&HealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2 + 1 * PixelScale, WindowHeight - 100 + 2 * PixelScale, (f32)GlobalContext.Health / (f32)GlobalContext.MaxHealth);
+                TextureDrawCustom(&BlankHealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2, WindowHeight - 100);
+
+                if(GlobalContext.PlayerX >= MapSizeY / 2 - 3 && GlobalContext.PlayerX <= MapSizeY / 2 + 3 && GlobalContext.PlayerY >= MapMargin - 4 && GlobalContext.PlayerY <= MapMargin + 2)
+                {
+                    FontDraw(&Font, StringBundleZ("SPACE FOR MENU"), WindowWidth / 2, WindowHeight - 150, 1);
+
+                    if(PressedSpace)
+                    {
+                        GlobalContext.ShopOpen = !GlobalContext.ShopOpen;
+                    }
+                }
+
+                if(GlobalContext.ShopOpen)
+                {
+                    u32 TopLeftX = WindowWidth / 2 - PixelScale * ShopUI.Width / 2;
+                    u32 TopLeftY = WindowHeight / 2 - PixelScale * ShopUI.Height / 2;
+
+                    u32 CardX = TopLeftX + 5 * PixelScale;
+                    u32 CardY = TopLeftY + 5 * PixelScale;
+
+                    TextureDrawCustom(&ShopUI, WindowWidth / 2 - PixelScale * ShopUI.Width / 2, WindowHeight / 2 - PixelScale * ShopUI.Height / 2);
+
+                    if(GlobalContext.MouseX >= CardX && GlobalContext.MouseX <= CardX + MaxHealth.Width * PixelScale && 
+                        GlobalContext.MouseY >= CardY && GlobalContext.MouseY <= CardY + MaxHealth.Height * PixelScale)
+                    {
+                        if(DidClick)
+                        {
+                            GlobalContext.MaxHealthLevel++;
+                            if(GlobalContext.MaxHealthLevel > 4)
+                            {
+                                GlobalContext.MaxHealthLevel = 4;
+                            }
+                        }
+
+                        GlobalContext.IsPointer = 1;
+                    }
+
+                    TextureDrawCustom(&MaxHealth.Frames[GlobalContext.MaxHealthLevel], CardX, CardY);
+                    CardX += (MaxHealth.Width + 5) * PixelScale;
+
+                    if(GlobalContext.MouseX >= CardX && GlobalContext.MouseX <= CardX + FasterRegen.Width * PixelScale && 
+                        GlobalContext.MouseY >= CardY && GlobalContext.MouseY <= CardY + FasterRegen.Height * PixelScale)
+                    {
+                        if(DidClick)
+                        {
+                            GlobalContext.FasterRegenLevel++;
+                            if(GlobalContext.FasterRegenLevel > 4)
+                            {
+                                GlobalContext.FasterRegenLevel = 4;
+                            }
+                        }
+
+                        GlobalContext.IsPointer = 1;
+                    }
+
+                    TextureDrawCustom(&FasterRegen.Frames[GlobalContext.FasterRegenLevel], CardX, CardY);
+                    CardX += (FasterRegen.Width + 5) * PixelScale;
+
+                    if(GlobalContext.MouseX >= CardX && GlobalContext.MouseX <= CardX + Multishot.Width * PixelScale && 
+                        GlobalContext.MouseY >= CardY && GlobalContext.MouseY <= CardY + Multishot.Height * PixelScale)
+                    {
+                        if(DidClick)
+                        {
+                           GlobalContext.MultishotLevel++;
+                            if(GlobalContext.MultishotLevel > 4)
+                            {
+                                GlobalContext.MultishotLevel = 4;
+                            }
+                        }
+
+                        GlobalContext.IsPointer = 1;
+                    }
+
+                    TextureDrawCustom(&Multishot.Frames[GlobalContext.MultishotLevel], CardX, CardY);
+                    CardX += (Multishot.Width + 5) * PixelScale;
+                }
+            } break;
+
+            case 2:
+            {
+                u32 TileMapX = (u32)(-GlobalContext.PlayerX * TilePixelSize + WindowWidth / 2);
+                u32 TileMapY = (u32)(-GlobalContext.PlayerY * TilePixelSize + WindowHeight / 2);
+
+                TileMapDraw(&SeaMap, TileMapX, TileMapY, FastAnimFrame);
+                TileMapDraw(&IslandMap, TileMapX, TileMapY, FastAnimFrame);
+                TileMapDraw(&OverlayMap, TileMapX, TileMapY, FastAnimFrame);
+
+                AnimationDraw(&CharacterIdleAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
+
+                u32 TopLeftX = WindowWidth / 2 - PixelScale * WinMenu.Width / 2;
+                u32 TopLeftY = WindowHeight / 2 - PixelScale * WinMenu.Height / 2;
+
+                TextureDrawCustom(&WinMenu, WindowWidth / 2 - PixelScale * WinMenu.Width / 2, WindowHeight / 2 - PixelScale * WinMenu.Height / 2);
+
+                FontDraw(&Font, StringBundleZ("PRESS R TO RESTART"), WindowWidth / 2, WindowHeight - 150, 1);
+            } break;
+
+            case 3:
+            {
+                u32 TileMapX = (u32)(-GlobalContext.PlayerX * TilePixelSize + WindowWidth / 2);
+                u32 TileMapY = (u32)(-GlobalContext.PlayerY * TilePixelSize + WindowHeight / 2);
+
+                TileMapDraw(&SeaMap, TileMapX, TileMapY, FastAnimFrame);
+                TileMapDraw(&IslandMap, TileMapX, TileMapY, FastAnimFrame);
+                TileMapDraw(&OverlayMap, TileMapX, TileMapY, FastAnimFrame);
+
+                AnimationDraw(&CharacterIdleAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
+
+                u32 TopLeftX = WindowWidth / 2 - PixelScale * GameOver.Width / 2;
+                u32 TopLeftY = WindowHeight / 2 - PixelScale * GameOver.Height / 2;
+
+                TextureDrawCustom(&GameOver, WindowWidth / 2 - PixelScale * GameOver.Width / 2, WindowHeight / 2 - PixelScale * GameOver.Height / 2);
+
+                FontDraw(&Font, StringBundleZ("PRESS R TO RESTART"), WindowWidth / 2, WindowHeight - 150, 1);
+            } break;
         }
 
-        ProjectileUpdate(DeltaTime);
-
-        for(projectile *Projectile = GlobalContext.Projectiles.Next;
-            Projectile != &GlobalContext.Projectiles;
-            Projectile = Projectile->Next)
+        if(GlobalContext.IsPointer)
         {
-            v2 Transformed = GetScreenPos(Projectile->Position);
-            animation *Animation = &Projectiles[Projectile->Type];
-            AnimationDraw(Animation, (u32)Transformed.X - TilePixelSize / 2, (u32)Transformed.Y - TilePixelSize / 2, SlowAnimFrame);
+            SDL_SetCursor(PointerCursor);
         }
-
-        if(ShouldShoot && GlobalContext.Health > 10)
+        else
         {
-            GlobalContext.Health -= 10;
-            ProjectileSpawn(V2(GlobalContext.PlayerX, GlobalContext.PlayerY) + V2(VelocityX, VelocityY), GlobalContext.ViewDirection * GlobalContext.ProjectileSpeed, 0, 0);
+            SDL_SetCursor(ArrowCursor);
         }
 
-        if(GlobalContext.EnemiesRemaining == 0 && !GlobalContext.IsWaitingForNextWave)
-        {
-            GlobalContext.TimeOfLastWaveEnd = Time;
-            GlobalContext.IsWaitingForNextWave = 1;
-        }
-
-        if(GlobalContext.IsWaitingForNextWave && GlobalContext.TimeOfLastWaveEnd + GlobalContext.WaveCooldown < Time)
-        {
-            GlobalContext.IsWaitingForNextWave = 0;
-
-            SpawnEnemies((GlobalContext.WaveIndex + 1) * 2 + GetRandom() % 2, CollisionMap.SizeX / 2.0f, CollisionMap.SizeY / 2.0f, 5);
-        }
-
-        AnimationDraw(&CharacterAnimation, WindowWidth / 2 - TilePixelSize / 2, WindowHeight / 2 - TilePixelSize, SlowAnimFrame);
-
-        TextureDrawCustomPartial(&HealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2 + 1 * PixelScale, WindowHeight - 100 + 2 * PixelScale, (f32)GlobalContext.Health / (f32)GlobalContext.MaxHealth);
-        TextureDrawCustom(&BlankHealthBar, WindowWidth / 2 - PixelScale * BlankHealthBar.Width / 2, WindowHeight - 100);
-
-        if(GlobalContext.PlayerX >= MapSizeY / 2 - 3 && GlobalContext.PlayerX <= MapSizeY / 2 + 3 && GlobalContext.PlayerY >= MapMargin - 4 && GlobalContext.PlayerY <= MapMargin + 2)
-        {
-            FontDraw(&Font, StringBundleZ("SPACE FOR MENU"), WindowWidth / 2, WindowHeight - 150, 1);
-        }
+        GlobalContext.IsPointer = 0;
 
         SDL_UpdateWindowSurface(Window);
 
-        if(ShouldRestart)
+        if(ShouldRestart && GlobalContext.GameState != 1)
         {
             GlobalContext.PlayerX = CollisionMap.SizeX / 2.0f;
             GlobalContext.PlayerY = CollisionMap.SizeY / 2.0f;
@@ -1121,6 +1426,25 @@ s32 main(s32 ArgsCount, char **Args)
 
             GlobalContext.EnemiesCount = 0;
             GlobalContext.EnemiesRemaining = 0;
+            GlobalContext.Health = GlobalContext.MaxHealth;
+
+            GlobalContext.MaxHealthLevel = 0;
+            GlobalContext.FasterRegenLevel = 0;
+            GlobalContext.MultishotLevel = 0;
+
+            projectile *ProjectileNext = 0;
+            for(projectile *Projectile = GlobalContext.Projectiles.Next;
+                Projectile != &GlobalContext.Projectiles;
+                Projectile = ProjectileNext)
+            {
+                ProjectileNext = Projectile->Next;
+
+                DoublyLinkedListRemove(Projectile);
+                DoublyLinkedListInsertBefore(&GlobalContext.FreeProjectiles, Projectile);
+            }
+
+            GlobalContext.GameState = 1;
+            GlobalContext.WaveIndex = 0;
         }
 
         SlowAnimFrame = (u32)(Time * 2);

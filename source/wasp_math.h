@@ -1294,7 +1294,15 @@ Determinant(v2 A, v2 B)
     return(Result);
 }
 
+internal inline v2
+V2Rotate(v2 V, f32 Angle)
+{
+    f32 S = Sin(Angle * D2R);
+    f32 C = Cos(Angle * D2R);
 
+    v2 Result = V2(V.X * C - V.Y * S, V.X * S + V.Y * C);
+    return(Result);
+}
 
 
 
